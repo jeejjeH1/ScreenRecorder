@@ -12,102 +12,66 @@ import android.view.View;
 import android.view.WindowManager;
 
 public class OverlayService extends Service {
-
-    private WindowManager windowManager;
+    private WindowManager wm;
     private View overlayView;
-    private WindowManager.LayoutParams params;
-    private boolean overlayViewInitialized = false;
+    private boolean isRunning = false;
 
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
+    @Override public IBinder onBind(Intent intent) { return null; }
+
+    @Override public void onCreate() {
+        super.onCreate();
+        wm = (WindowManager) getSystemService(WINDOW_SERVICE);
     }
 
-    @Override
-    public void onCreate() {
-        super.onCreate();
-        windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
+        if (!isRunning) showOverlay();
+        return START_STICKY;
+    }
 
-        // Inflate overlay layout
+    private void showOverlay() {
         overlayView = LayoutInflater.from(this).inflate(R.layout.overlay_button, null);
-        overlayViewInitialized = true;
-
-        // Layout params for floating button
-        int overlayType;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            overlayType = WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY;
-        } else {
-            overlayType = WindowManager.LayoutParams.TYPE_PHONE;
-        }
-
-        params = new WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                overlayType,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-                PixelFormat.TRANSLUCENT
-        );
+        int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
+        WindowManager.LayoutParams params = new WindowManager.LayoutParams(180, 180, type,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.START;
-        params.x = 0;
-        params.y = 300;
+        params.x = 0; params.y = 400;
 
-        // Make the button draggable
-        final int[] initialX = {0};
-        final int[] initialY = {0};
-        final float[] initialTouchX = {0f};
-        final float[] initialTouchY = {0f};
+        final int[] lastX = {0}, lastY = {0}, startX = {0}, startY = {0}, initialX = {0}, initialY = {0};
+        final boolean[] moving = {false};
 
         overlayView.setOnTouchListener((v, event) -> {
             switch (event.getAction()) {
                 case MotionEvent.ACTION_DOWN:
-                    initialX[0] = params.x;
-                    initialY[0] = params.y;
-                    initialTouchX[0] = event.getRawX();
-                    initialTouchY[0] = event.getRawY();
+                    initialX[0] = params.x; initialY[0] = params.y;
+                    startX[0] = (int) event.getRawX(); startY[0] = (int) event.getRawY();
+                    moving[0] = false;
                     return true;
-
+                case MotionEvent.ACTION_MOVE:
+                    int dx = (int) event.getRawX() - startX[0], dy = (int) event.getRawY() - startY[0];
+                    if (Math.abs(dx) > 10 || Math.abs(dy) > 10) moving[0] = true;
+                    params.x = initialX[0] + dx; params.y = initialY[0] + dy;
+                    wm.updateViewLayout(overlayView, params);
+                    return true;
                 case MotionEvent.ACTION_UP:
-                    // If it was just a tap (not a drag)
-                    float dx = Math.abs(event.getRawX() - initialTouchX[0]);
-                    float dy = Math.abs(event.getRawY() - initialTouchY[0]);
-                    if (dx < 10 && dy < 10) {
-                        // Stop recording
-                        Intent intent = new Intent(OverlayService.this, RecordingService.class);
-                        intent.setAction(RecordingService.ACTION_STOP);
-                        startService(intent);
-
-                        Intent mainIntent = new Intent(OverlayService.this, MainActivity.class);
-                        mainIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                        startActivity(mainIntent);
-
+                    if (!moving[0]) {
+                        Intent i = new Intent(OverlayService.this, RecordingService.class);
+                        i.setAction(RecordingService.ACTION_STOP);
+                        startService(i);
                         stopSelf();
                     }
                     return true;
-
-                case MotionEvent.ACTION_MOVE:
-                    params.x = initialX[0] + (int) (event.getRawX() - initialTouchX[0]);
-                    params.y = initialY[0] + (int) (event.getRawY() - initialTouchY[0]);
-                    windowManager.updateViewLayout(overlayView, params);
-                    return true;
-
-                default:
-                    return false;
             }
+            return false;
         });
 
-        windowManager.addView(overlayView, params);
+        wm.addView(overlayView, params);
+        isRunning = true;
     }
 
-    @Override
-    public void onDestroy() {
+    @Override public void onDestroy() {
+        if (overlayView != null) { wm.removeView(overlayView); overlayView = null; }
+        isRunning = false;
         super.onDestroy();
-        if (overlayViewInitialized) {
-            try {
-                windowManager.removeView(overlayView);
-            } catch (Exception e) {
-                // View already removed
-            }
-        }
     }
 }

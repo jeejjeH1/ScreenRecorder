@@ -8,448 +8,222 @@ import android.app.Service;
 import android.content.Intent;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaCodec;
 import android.media.MediaCodecInfo;
 import android.media.MediaFormat;
 import android.media.MediaMuxer;
-import android.media.MediaScannerConnection;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
-import android.media.AudioFormat;
-import android.media.MediaRecorder;
 import android.os.Build;
-import android.os.Environment;
 import android.os.IBinder;
-import android.util.DisplayMetrics;
+import android.os.ParcelFileDescriptor;
 import android.util.Log;
-import android.view.WindowManager;
+import android.view.Surface;
 
-import java.io.File;
+import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import java.util.Locale;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class RecordingService extends Service {
-
-    // Static constants (replacing companion object)
-    public static final String ACTION_STOP = "ACTION_STOP";
-    public static final String NOTIFICATION_CHANNEL_ID = "screen_recording_channel";
+    private static final String TAG = "RecordingService";
+    public static final String ACTION_STOP = "com.screenrecorder.app.STOP";
+    public static final String CHANNEL_ID = "screen_recording_channel";
     public static final int NOTIFICATION_ID = 1001;
-    private static boolean sIsRunning = false;
-
-    public static boolean isRunning() {
-        return sIsRunning;
-    }
+    private static boolean sRunning = false;
+    public static boolean isRunning() { return sRunning; }
 
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
-    private AudioRecord audioRecord;
     private MediaMuxer mediaMuxer;
+    private MediaCodec videoEncoder, audioEncoder;
+    private AudioRecord audioRecord;
+    private Surface inputSurface;
+    private boolean muxerStarted = false;
+    private int videoTrackIndex = -1, audioTrackIndex = -1;
+    private int screenWidth, screenHeight, screenDpi;
+    private final AtomicBoolean isRecording = new AtomicBoolean(false);
+    private Thread audioThread, videoThread;
 
-    private MediaCodec videoEncoder;
-    private MediaCodec audioEncoder;
+    @Override public IBinder onBind(Intent intent) { return null; }
 
-    private boolean isMuxerStarted = false;
-    private int videoTrackIndex = -1;
-    private int audioTrackIndex = -1;
-    private MediaCodec.BufferInfo audioBufferInfo = new MediaCodec.BufferInfo();
-    private MediaCodec.BufferInfo videoBufferInfo = new MediaCodec.BufferInfo();
-
-    private int screenWidth = 1080;
-    private int screenHeight = 1920;
-    private int screenDpi = 320;
-
-    private String outputPath = "";
-    private Thread recordingThread;
-    private Thread audioThread;
-    private Thread muxerThread;
-
-    @Override
-    public IBinder onBind(Intent intent) {
-        return null;
-    }
-
-    @Override
-    public void onCreate() {
+    @Override public void onCreate() {
         super.onCreate();
         createNotificationChannel();
     }
 
-    @SuppressWarnings("deprecation")
-    @Override
-    public int onStartCommand(Intent intent, int flags, int startId) {
+    @Override public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
             stopRecording();
             return START_NOT_STICKY;
         }
+        if (intent == null) { stopSelf(); return START_NOT_STICKY; }
 
-        int resultCode = intent != null ? intent.getIntExtra("resultCode", -1) : -1;
-        Intent data = intent != null ? intent.getParcelableExtra("data") : null;
+        int resultCode = intent.getIntExtra("resultCode", -1);
+        Intent data = intent.getParcelableExtra("data");
+        if (resultCode == -1 || data == null) { stopSelf(); return START_NOT_STICKY; }
 
-        if (resultCode == -1 || data == null) {
-            stopSelf();
-            return START_NOT_STICKY;
-        }
-
-        // Start foreground immediately
-        startForeground(NOTIFICATION_ID, buildNotification("در حال آماده‌سازی..."));
-
-        // Get screen metrics
-        WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
-        DisplayMetrics metrics = new DisplayMetrics();
-        wm.getDefaultDisplay().getRealMetrics(metrics);
-        screenWidth = metrics.widthPixels;
-        screenHeight = metrics.heightPixels;
-        screenDpi = metrics.densityDpi;
-
-        // Ensure dimensions are even (required by encoder)
-        screenWidth = (screenWidth / 2) * 2;
-        screenHeight = (screenHeight / 2) * 2;
-
-        // Create output file
-        String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date());
-        String fileName = "ScreenRecord_" + timestamp + ".mp4";
-
-        File storageDir;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            storageDir = new File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "ScreenRecordings");
-        } else {
-            storageDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "ScreenRecordings");
-        }
-        storageDir.mkdirs();
-        File file = new File(storageDir, fileName);
-        outputPath = file.getAbsolutePath();
-
-        // Start recording
-        try {
-            startRecording(resultCode, data);
-            sIsRunning = true;
-            updateNotification("در حال ضبط صفحه");
-        } catch (Exception e) {
-            Log.e("RecordingService", "Recording failed", e);
-            stopSelf();
-        }
-
-        return START_NOT_STICKY;
+        startForeground(NOTIFICATION_ID, buildNotification("Recording..."));
+        startRecording(resultCode, data);
+        return START_STICKY;
     }
 
-    @SuppressWarnings("deprecation")
     private void startRecording(int resultCode, Intent data) {
-        MediaProjectionManager projectionManager =
-                (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        mediaProjection = projectionManager.getMediaProjection(resultCode, data);
-
-        mediaProjection.registerCallback(new MediaProjection.Callback() {
-            @Override
-            public void onStop() {
-                if (sIsRunning) {
-                    stopRecording();
-                }
-            }
-        }, null);
-
-        // Setup video encoder
-        MediaFormat videoFormat = MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_AVC, screenWidth, screenHeight);
-        videoFormat.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000); // 8 Mbps
-        videoFormat.setInteger(MediaFormat.KEY_FRAME_RATE, 30);
-        videoFormat.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-        videoFormat.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
-        videoFormat.setInteger(MediaFormat.KEY_PRIORITY, 0); // REAL_TIME
-
         try {
+            screenWidth = 1080; screenHeight = 1920; screenDpi = 320;
+            MediaProjectionManager mgr = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            mediaProjection = mgr.getMediaProjection(resultCode, data);
+            if (mediaProjection == null) { stopSelf(); return; }
+
+            sRunning = true;
+            isRecording.set(true);
+
+            // Video encoder
+            MediaFormat vidFmt = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, screenWidth, screenHeight);
+            vidFmt.setInteger(MediaFormat.KEY_BIT_RATE, 8_000_000);
+            vidFmt.setInteger(MediaFormat.KEY_FRAME_RATE, 30);
+            vidFmt.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+            vidFmt.setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
             videoEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-        } catch (Exception e) {
-            Log.e("RecordingService", "Failed to create video encoder", e);
-            return;
-        }
-        videoEncoder.configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            videoEncoder.configure(vidFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            inputSurface = videoEncoder.createInputSurface();
+            videoEncoder.start();
 
-        // Setup muxer
-        try {
-            mediaMuxer = new MediaMuxer(outputPath,
-                    MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-        } catch (Exception e) {
-            Log.e("RecordingService", "Failed to create muxer", e);
-            return;
-        }
-
-        // Setup audio encoder
-        int sampleRate = 44100;
-        int channelCount = 1;
-        MediaFormat audioFormat = MediaFormat.createAudioFormat(
-                MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount);
-        audioFormat.setInteger(MediaFormat.KEY_BIT_RATE, 128_000);
-        audioFormat.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384);
-
-        try {
+            // Audio encoder
+            int sampleRate = 44100, channelCount = 1;
+            int audioFormat = AudioFormat.ENCODING_PCM_16BIT;
+            int bufferSize = AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, audioFormat) * 2;
+            audioRecord = new AudioRecord(android.media.MediaRecorder.AudioSource.MIC, sampleRate, AudioFormat.CHANNEL_IN_MONO, audioFormat, bufferSize);
+            MediaFormat audFmt = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount);
+            audFmt.setInteger(MediaFormat.KEY_BIT_RATE, 128_000);
+            audFmt.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
             audioEncoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-        } catch (Exception e) {
-            Log.e("RecordingService", "Failed to create audio encoder", e);
-            return;
-        }
-        audioEncoder.configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            audioEncoder.configure(audFmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+            audioEncoder.start();
+            audioRecord.startRecording();
 
-        // Setup audio record
-        int bufferSize = AudioRecord.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT
-        );
+            // Virtual display
+            virtualDisplay = mediaProjection.createVirtualDisplay("ScreenRecorder", screenWidth, screenHeight, screenDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, inputSurface, null, null);
 
-        audioRecord = new AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize
-        );
+            // Muxer
+            String path = android.os.Environment.getExternalStoragePublicDirectory(android.os.Environment.DIRECTORY_MOVIES)
+                    + "/ScreenRecorder_" + System.currentTimeMillis() + ".mp4";
+            mediaMuxer = new MediaMuxer(path, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+            mediaProjection.registerCallback(new MediaProjection.Callback() {
+                @Override public void onStop() { stopRecording(); }
+            }, null);
 
-        // Start everything
-        videoEncoder.start();
-        audioEncoder.start();
-        audioRecord.startRecording();
-
-        // Create input surface for video
-        android.view.Surface inputSurface = videoEncoder.createInputSurface();
-
-        // Create virtual display
-        virtualDisplay = mediaProjection.createVirtualDisplay(
-                "ScreenRecorder",
-                screenWidth,
-                screenHeight,
-                screenDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                inputSurface,
-                null,
-                null
-        );
-
-        // Start encoding threads
-        startVideoEncoding();
-        startAudioEncoding();
-    }
-
-    private void startVideoEncoding() {
-        recordingThread = new Thread(() -> {
-            MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-            long timeoutUs = 10_000L;
-
-            while (sIsRunning) {
-                int index = videoEncoder.dequeueOutputBuffer(bufferInfo, timeoutUs);
-                if (index == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    continue;
-                } else if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    synchronized (RecordingService.this) {
+            // Video thread
+            videoThread = new Thread(() -> {
+                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                while (isRecording.get()) {
+                    int idx = videoEncoder.dequeueOutputBuffer(info, 10000);
+                    if (idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         videoTrackIndex = mediaMuxer.addTrack(videoEncoder.getOutputFormat());
-                        checkAndStartMuxer();
+                        checkMuxer();
+                    } else if (idx >= 0) {
+                        ByteBuffer buf = videoEncoder.getOutputBuffer(idx);
+                        if (buf != null && info.size > 0 && muxerStarted) {
+                            buf.position(info.offset);
+                            buf.limit(info.offset + info.size);
+                            mediaMuxer.writeSampleData(videoTrackIndex, buf, info);
+                        }
+                        videoEncoder.releaseOutputBuffer(idx, false);
                     }
-                } else if (index >= 0) {
-                    ByteBuffer outputBuffer = videoEncoder.getOutputBuffer(index);
-                    if (outputBuffer == null) continue;
-                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        bufferInfo.size = 0;
-                    }
-                    if (bufferInfo.size > 0 && isMuxerStarted) {
-                        outputBuffer.position(bufferInfo.offset);
-                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
-                        synchronized (RecordingService.this) {
-                            try {
-                                mediaMuxer.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo);
-                            } catch (Exception e) {
-                                Log.e("RecordingService", "Error writing video data", e);
-                            }
+                }
+            }, "VideoEncoder");
+
+            // Audio thread
+            audioThread = new Thread(() -> {
+                MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                byte[] buf = new byte[bufferSize];
+                while (isRecording.get()) {
+                    int read = audioRecord.read(buf, 0, buf.length);
+                    if (read > 0) {
+                        int inIdx = audioEncoder.dequeueInputBuffer(10000);
+                        if (inIdx >= 0) {
+                            ByteBuffer inBuf = audioEncoder.getInputBuffer(inIdx);
+                            inBuf.clear();
+                            inBuf.put(buf, 0, read);
+                            audioEncoder.queueInputBuffer(inIdx, 0, read, System.nanoTime() / 1000, 0);
                         }
                     }
-                    videoEncoder.releaseOutputBuffer(index, false);
-                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        break;
-                    }
-                }
-            }
-        });
-        recordingThread.start();
-    }
-
-    private void startAudioEncoding() {
-        audioThread = new Thread(() -> {
-            int bufferSize = 4096;
-            byte[] buffer = new byte[bufferSize];
-            long timeoutUs = 10_000L;
-
-            while (sIsRunning) {
-                // Read audio from microphone
-                int readSize = audioRecord.read(buffer, 0, bufferSize);
-                if (readSize <= 0) continue;
-
-                // Feed to encoder
-                int inputIndex = audioEncoder.dequeueInputBuffer(timeoutUs);
-                if (inputIndex >= 0) {
-                    ByteBuffer inputBuffer = audioEncoder.getInputBuffer(inputIndex);
-                    if (inputBuffer == null) continue;
-                    inputBuffer.clear();
-                    inputBuffer.put(buffer, 0, readSize);
-                    audioEncoder.queueInputBuffer(inputIndex, 0, readSize,
-                            System.nanoTime() / 1000, 0);
-                }
-
-                // Get encoded output
-                MediaCodec.BufferInfo bufferInfo = new MediaCodec.BufferInfo();
-                int outputIndex = audioEncoder.dequeueOutputBuffer(bufferInfo, timeoutUs);
-                while (outputIndex >= 0) {
-                    ByteBuffer outputBuffer = audioEncoder.getOutputBuffer(outputIndex);
-                    if (outputBuffer == null) break;
-                    if ((bufferInfo.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
-                        bufferInfo.size = 0;
-                    }
-                    if (bufferInfo.size > 0 && isMuxerStarted) {
-                        outputBuffer.position(bufferInfo.offset);
-                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size);
-                        synchronized (RecordingService.this) {
-                            try {
-                                mediaMuxer.writeSampleData(audioTrackIndex, outputBuffer, bufferInfo);
-                            } catch (Exception e) {
-                                Log.e("RecordingService", "Error writing audio data", e);
-                            }
+                    int outIdx = audioEncoder.dequeueOutputBuffer(info, 10000);
+                    if (outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        audioTrackIndex = mediaMuxer.addTrack(audioEncoder.getOutputFormat());
+                        checkMuxer();
+                    } else if (outIdx >= 0) {
+                        ByteBuffer outBuf = audioEncoder.getOutputBuffer(outIdx);
+                        if (outBuf != null && info.size > 0 && muxerStarted) {
+                            outBuf.position(info.offset);
+                            outBuf.limit(info.offset + info.size);
+                            mediaMuxer.writeSampleData(audioTrackIndex, outBuf, info);
                         }
+                        audioEncoder.releaseOutputBuffer(outIdx, false);
                     }
-                    audioEncoder.releaseOutputBuffer(outputIndex, false);
-                    outputIndex = audioEncoder.dequeueOutputBuffer(bufferInfo, 0);
                 }
-            }
-        });
-        audioThread.start();
+            }, "AudioEncoder");
+
+            videoThread.start();
+            audioThread.start();
+            updateNotification("Recording screen");
+        } catch (Exception e) {
+            Log.e(TAG, "Start failed", e);
+            stopSelf();
+        }
     }
 
-    private synchronized void checkAndStartMuxer() {
-        if (!isMuxerStarted && videoTrackIndex >= 0 && audioTrackIndex >= 0) {
+    private void checkMuxer() {
+        if (!muxerStarted && videoTrackIndex >= 0 && audioTrackIndex >= 0) {
             mediaMuxer.start();
-            isMuxerStarted = true;
+            muxerStarted = true;
         }
     }
 
     private void stopRecording() {
-        sIsRunning = false;
-
-        try {
-            if (recordingThread != null) {
-                recordingThread.join(3000);
-            }
-            if (audioThread != null) {
-                audioThread.join(3000);
-            }
-
-            if (audioRecord != null) {
-                audioRecord.stop();
-                audioRecord.release();
-                audioRecord = null;
-            }
-
-            if (audioEncoder != null) {
-                audioEncoder.stop();
-                audioEncoder.release();
-                audioEncoder = null;
-            }
-
-            if (videoEncoder != null) {
-                videoEncoder.stop();
-                videoEncoder.release();
-                videoEncoder = null;
-            }
-
-            if (virtualDisplay != null) {
-                virtualDisplay.release();
-                virtualDisplay = null;
-            }
-
-            if (mediaProjection != null) {
-                mediaProjection.stop();
-                mediaProjection = null;
-            }
-
-            if (isMuxerStarted) {
-                mediaMuxer.stop();
-            }
-            if (mediaMuxer != null) {
-                mediaMuxer.release();
-                mediaMuxer = null;
-            }
-            isMuxerStarted = false;
-            videoTrackIndex = -1;
-            audioTrackIndex = -1;
-
-            // Notify gallery
-            MediaScannerConnection.scanFile(
-                    this,
-                    new String[]{outputPath},
-                    new String[]{"video/mp4"},
-                    null
-            );
-
-        } catch (Exception e) {
-            Log.e("RecordingService", "Error stopping recording", e);
-        }
-
-        stopForeground(STOP_FOREGROUND_REMOVE);
+        if (!sRunning) { stopSelf(); return; }
+        isRecording.set(false);
+        sRunning = false;
+        try { if (audioRecord != null) audioRecord.stop(); } catch (Exception ignored) {}
+        try { if (videoEncoder != null) videoEncoder.stop(); } catch (Exception ignored) {}
+        try { if (audioEncoder != null) audioEncoder.stop(); } catch (Exception ignored) {}
+        try { if (videoEncoder != null) videoEncoder.release(); } catch (Exception ignored) {}
+        try { if (audioEncoder != null) audioEncoder.release(); } catch (Exception ignored) {}
+        try { if (virtualDisplay != null) virtualDisplay.release(); } catch (Exception ignored) {}
+        try { if (inputSurface != null) inputSurface.release(); } catch (Exception ignored) {}
+        try { if (mediaMuxer != null) { if (muxerStarted) mediaMuxer.stop(); mediaMuxer.release(); } } catch (Exception ignored) {}
+        try { if (mediaProjection != null) mediaProjection.stop(); } catch (Exception ignored) {}
+        try { if (audioThread != null) audioThread.join(2000); } catch (Exception ignored) {}
+        try { if (videoThread != null) videoThread.join(2000); } catch (Exception ignored) {}
+        stopForeground(true);
         stopSelf();
     }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    NOTIFICATION_CHANNEL_ID,
-                    "ضبط صفحه",
-                    NotificationManager.IMPORTANCE_LOW
-            );
-            channel.setDescription("کنترل ضبط صفحه");
-            channel.setShowBadge(false);
-            NotificationManager notificationManager =
-                    getSystemService(NotificationManager.class);
-            notificationManager.createNotificationChannel(channel);
+        if (Build.VERSION.SDK_INT >= 26) {
+            NotificationChannel ch = new NotificationChannel(CHANNEL_ID, "Screen Recording", NotificationManager.IMPORTANCE_LOW);
+            ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).createNotificationChannel(ch);
         }
     }
 
     private Notification buildNotification(String text) {
-        Intent stopIntent = new Intent(this, RecordingService.class);
-        stopIntent.setAction(ACTION_STOP);
-        PendingIntent stopPendingIntent = PendingIntent.getService(
-                this, 0, stopIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
-
-        Intent openIntent = new Intent(this, MainActivity.class);
-        PendingIntent openPendingIntent = PendingIntent.getActivity(
-                this, 0, openIntent,
-                PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
-        );
-
-        return new Notification.Builder(this, NOTIFICATION_CHANNEL_ID)
-                .setContentTitle("Screen Recorder")
-                .setContentText(text)
-                .setSmallIcon(R.drawable.ic_record)
-                .setOngoing(true)
-                .setContentIntent(openPendingIntent)
-                .addAction(
-                        new Notification.Action.Builder(
-                                null, "توقف", stopPendingIntent
-                        ).build()
-                )
-                .build();
+        Intent stopIntent = new Intent(this, RecordingService.class); stopIntent.setAction(ACTION_STOP);
+        PendingIntent pi = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE);
+        Notification.Builder b;
+        if (Build.VERSION.SDK_INT >= 26) b = new Notification.Builder(this, CHANNEL_ID);
+        else b = new Notification.Builder(this);
+        return b.setContentTitle("Screen Recorder").setContentText(text)
+                .setSmallIcon(android.R.drawable.ic_media_pause)
+                .addAction(android.R.drawable.ic_media_pause, "Stop", pi)
+                .setOngoing(true).build();
     }
 
     private void updateNotification(String text) {
-        NotificationManager notificationManager = getSystemService(NotificationManager.class);
-        notificationManager.notify(NOTIFICATION_ID, buildNotification(text));
+        ((NotificationManager) getSystemService(NOTIFICATION_SERVICE)).notify(NOTIFICATION_ID, buildNotification(text));
     }
 
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        if (sIsRunning) {
-            stopRecording();
-        }
-    }
+    @Override public void onDestroy() { stopRecording(); super.onDestroy(); }
 }
