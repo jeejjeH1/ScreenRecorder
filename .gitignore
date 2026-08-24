@@ -1,0 +1,14 @@
+.gradle/
+build/
+build_output/
+build_manual/
+app/build/
+libs/
+*.jar
+*.zip
+*.dex
+.gradle
+local.properties
+gradlew
+gradlew.bat
+gradle/wrapper/gradle-wrapper.jar

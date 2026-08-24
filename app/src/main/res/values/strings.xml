@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Screen Recorder</string>
+    <string name="start_recording">شروع ضبط</string>
+    <string name="stop_recording">توقف ضبط</string>
+    <string name="recording">در حال ضبط…</string>
+    <string name="ready_to_record">آماده ضبط</string>
+</resources>
